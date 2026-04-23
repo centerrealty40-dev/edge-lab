@@ -1,0 +1,8 @@
+.env
+.venv/
+uv.lock
+out/
+__pycache__/
+*.pyc
+.ruff_cache/
+.ipynb_checkpoints/
