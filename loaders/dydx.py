@@ -69,10 +69,15 @@ def _file(d: date, market: str, channel: str) -> Path | None:
     return p if p.exists() and p.stat().st_size > 0 else None
 
 
-def iter_jsonl_gz(path: Path) -> Iterator[dict]:
-    """Read jsonl.gz robustly. The streamer appends to today's file in real time
-    so it has no end-of-stream marker — Python's gzip refuses, but system
-    gunzip happily reads up to the last complete record. We pipe through it.
+def iter_jsonl_gz(path: Path) -> Iterator[tuple[int | None, dict]]:
+    """Read jsonl.gz robustly, yielding (recv_ms_or_None, msg).
+
+    The streamer (post-fix) wraps each line as {"recv_ms": <int>, "msg": {...}}.
+    For old (pre-fix) data we yield (None, raw_msg) so callers can fall back
+    to the broken interpolation logic.
+
+    Uses system gunzip via subprocess: tolerant to in-progress files lacking
+    the end-of-stream marker.
     """
     proc = subprocess.Popen(
         ["gunzip", "-c", str(path)],
@@ -87,9 +92,13 @@ def iter_jsonl_gz(path: Path) -> Iterator[dict]:
             if not line:
                 continue
             try:
-                yield json.loads(line)
+                obj = json.loads(line)
             except Exception:
                 continue
+            if isinstance(obj, dict) and "recv_ms" in obj and "msg" in obj:
+                yield (int(obj["recv_ms"]), obj["msg"])
+            else:
+                yield (None, obj)
     finally:
         try:
             proc.kill()
@@ -107,7 +116,7 @@ def read_trades_day(symbol: str, d: date) -> pl.DataFrame:
         return pl.DataFrame()
 
     rows: list[dict] = []
-    for msg in iter_jsonl_gz(p):
+    for _recv_ms, msg in iter_jsonl_gz(p):
         contents = msg.get("contents") or {}
         trades = contents.get("trades") if isinstance(contents, dict) else None
         if not isinstance(trades, list):
@@ -134,29 +143,31 @@ def l2_top_of_book_day(symbol: str, d: date) -> pl.DataFrame:
     samples whenever the best bid or ask changes.
     Returns: ts_ms (i64), bid (f64), ask (f64), bid_sz (f64), ask_sz (f64).
 
-    ts_ms: milliseconds since epoch, derived from message arrival order
-    interpolated linearly across the day (we don't have per-message ts in batch
-    deltas). Good enough for 1Hz mid resampling, NOT for HFT-tick accuracy.
+    Time source: prefers `recv_ms` from the streamer wrapper. If absent (old
+    pre-fix files), refuses to fabricate timestamps and returns an empty frame
+    — interpolation across uneven message rates is misleading for analysis.
     """
     market = hl_to_dydx(symbol)
     p = _file(d, market, "v4_orderbook")
     if p is None:
         return pl.DataFrame()
 
-    bids: SortedDict = SortedDict()  # price (f) -> size (f); we'll get top by max key
-    asks: SortedDict = SortedDict()  # price (f) -> size (f); top by min key
+    bids: SortedDict = SortedDict()
+    asks: SortedDict = SortedDict()
 
-    rows: list[tuple[float, float, float, float]] = []
-    msg_count = 0
+    rows: list[tuple[int, float, float, float, float]] = []
     last_top: tuple[float | None, float | None, float | None, float | None] = (None, None, None, None)
+    saw_any_recv_ms = False
+    last_recv_ms: int | None = None
 
-    for msg in iter_jsonl_gz(p):
-        msg_count += 1
+    for recv_ms, msg in iter_jsonl_gz(p):
+        if recv_ms is not None:
+            saw_any_recv_ms = True
+            last_recv_ms = recv_ms
         t = msg.get("type")
         contents = msg.get("contents")
 
         if t == "subscribed" and isinstance(contents, dict):
-            # initial snapshot
             bids.clear()
             asks.clear()
             for px_s, sz_s in contents.get("bids") or []:
@@ -184,7 +195,6 @@ def l2_top_of_book_day(symbol: str, d: date) -> pl.DataFrame:
                                 book[px] = sz
 
         elif t == "channel_data" and isinstance(contents, dict):
-            # rare snapshot replays — same shape as subscribed
             if "bids" in contents or "asks" in contents:
                 for px_s, sz_s in contents.get("bids") or []:
                     sz = float(sz_s)
@@ -199,34 +209,27 @@ def l2_top_of_book_day(symbol: str, d: date) -> pl.DataFrame:
                     else:
                         asks.pop(float(px_s), None)
 
-        # Sample top-of-book on every message (we resample later)
-        if bids and asks:
-            top_bid_px = bids.keys()[-1]  # max
-            top_ask_px = asks.keys()[0]   # min
+        if bids and asks and last_recv_ms is not None:
+            top_bid_px = bids.keys()[-1]
+            top_ask_px = asks.keys()[0]
             top = (top_bid_px, top_ask_px, bids[top_bid_px], asks[top_ask_px])
             if top != last_top:
-                rows.append((msg_count, top_bid_px, top_ask_px, bids[top_bid_px], asks[top_ask_px]))
+                rows.append((last_recv_ms, top_bid_px, top_ask_px, bids[top_bid_px], asks[top_ask_px]))
                 last_top = top
+
+    if not saw_any_recv_ms:
+        # Old data without recv_ms wrapping — don't fake timestamps.
+        return pl.DataFrame()
 
     if not rows:
         return pl.DataFrame()
 
-    # Map message-counter to time using day bounds + total message count
-    day_start_ms = int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp() * 1000)
-    day_end_ms = day_start_ms + 86_400_000
-    total = msg_count if msg_count > 0 else 1
-    span_ms = day_end_ms - day_start_ms
-
-    df = pl.DataFrame(
+    return pl.DataFrame(
         rows,
-        schema=[("msg_idx", pl.Int64), ("bid", pl.Float64), ("ask", pl.Float64),
+        schema=[("ts_ms", pl.Int64), ("bid", pl.Float64), ("ask", pl.Float64),
                 ("bid_sz", pl.Float64), ("ask_sz", pl.Float64)],
         orient="row",
     )
-    df = df.with_columns(
-        (pl.lit(day_start_ms) + (pl.col("msg_idx") * span_ms / total).cast(pl.Int64)).alias("ts_ms")
-    ).select("ts_ms", "bid", "ask", "bid_sz", "ask_sz")
-    return df
 
 
 def date_range(start: date, end: date) -> Iterator[date]:
