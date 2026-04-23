@@ -30,6 +30,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import subprocess
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from sortedcontainers import SortedDict
@@ -69,15 +70,32 @@ def _file(d: date, market: str, channel: str) -> Path | None:
 
 
 def iter_jsonl_gz(path: Path) -> Iterator[dict]:
-    with gzip.open(path, "rt", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
+    """Read jsonl.gz robustly. The streamer appends to today's file in real time
+    so it has no end-of-stream marker — Python's gzip refuses, but system
+    gunzip happily reads up to the last complete record. We pipe through it.
+    """
+    proc = subprocess.Popen(
+        ["gunzip", "-c", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=1 << 16,
+    )
+    try:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:
                 yield json.loads(line)
             except Exception:
                 continue
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
 
 
 def read_trades_day(symbol: str, d: date) -> pl.DataFrame:
