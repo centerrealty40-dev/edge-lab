@@ -15,7 +15,9 @@ Files are plain .jsonl per UTC day (some old files .jsonl.gz, we handle both).
 from __future__ import annotations
 
 import gzip
+import json
 import os
+import subprocess
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
@@ -27,10 +29,31 @@ def _data_root() -> Path:
     return Path(os.getenv("HL_DATA_ROOT", "/opt/hl-research/data")).resolve()
 
 
-def _open(path: Path):
+def _iter_lines(path: Path) -> Iterator[str]:
+    """Read lines from .jsonl or .jsonl.gz, robust against truncated/in-progress
+    files (e.g. an old .gz that wasn't closed cleanly).
+    """
     if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return open(path, "rt", encoding="utf-8")
+        proc = subprocess.Popen(
+            ["gunzip", "-c", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=1 << 16,
+        )
+        try:
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                yield raw.decode("utf-8", errors="replace")
+        finally:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+    else:
+        with open(path, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                yield line
 
 
 def _day_files(kind: str, coin: str, d: date) -> list[Path]:
@@ -73,7 +96,9 @@ def read_trades_day(coin: str, d: date) -> pl.DataFrame:
     paths = _day_files("trades", coin, d)
     if not paths:
         return pl.DataFrame()
-    # take the first (prefer .jsonl over .gz if both exist; both should be same content)
+    # Prefer plain .jsonl over .gz (.gz is often an older partial dump
+    # and polars.read_ndjson expects plain text)
+    paths.sort(key=lambda p: 0 if p.suffix == ".jsonl" else 1)
     df = pl.read_ndjson(paths[0])
     if df.is_empty():
         return df
@@ -91,17 +116,20 @@ def read_trades_day(coin: str, d: date) -> pl.DataFrame:
 def iter_l2_day(coin: str, d: date) -> Iterator[dict]:
     """Yields raw L2 messages so callers can do what they want without paying
     DataFrame allocation cost for 100M+ levels in memory."""
-    import json
-    for path in _day_files("l2_book", coin, d):
-        with _open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except Exception:
-                    continue
+    # Prefer plain .jsonl over .jsonl.gz (often the .gz is an old partial dump)
+    paths = _day_files("l2_book", coin, d)
+    paths.sort(key=lambda p: 0 if p.suffix == ".jsonl" else 1)
+    for path in paths:
+        for raw in _iter_lines(path):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+        # We expect just one source-of-truth file per day; first one wins.
+        return
 
 
 def l2_top_of_book_day(coin: str, d: date) -> pl.DataFrame:
